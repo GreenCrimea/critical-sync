@@ -34,9 +34,16 @@ resolve_config_base() {
   echo "$base"
 }
 
-CONFIG_BASE="$(resolve_config_base)"
-CONFIG_DIR="$CONFIG_BASE/critical-sync"
-CONFIG_FILE="$CONFIG_DIR/critical-sync.conf"
+# Allow explicit config file override (useful for systemd services)
+if [[ -n "${CRITICAL_SYNC_CONFIG_FILE:-}" ]]; then
+  CONFIG_FILE="$CRITICAL_SYNC_CONFIG_FILE"
+  CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+  CONFIG_BASE="$(dirname "$CONFIG_DIR")"
+else
+  CONFIG_BASE="$(resolve_config_base)"
+  CONFIG_DIR="$CONFIG_BASE/critical-sync"
+  CONFIG_FILE="$CONFIG_DIR/critical-sync.conf"
+fi
 
 # CLI flags
 DRY_RUN=0
@@ -195,6 +202,171 @@ notify() {
 }
 
 
+SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+
+prompt_default() {
+  # prompt_default "Prompt" "default" outvar
+  local prompt="$1"
+  local def="$2"
+  local __outvar="$3"
+  local input=""
+  read -r -p "$prompt [$def]: " input || return 1
+  input="${input#"${input%%[![:space:]]*}"}"
+  input="${input%"${input##*[![:space:]]}"}"
+  [[ -z "$input" ]] && input="$def"
+  printf -v "$__outvar" '%s' "$input"
+}
+
+prompt_int_default() {
+  # prompt_int_default "Prompt" default outvar
+  local prompt="$1"
+  local def="$2"
+  local __outvar="$3"
+  local input=""
+  while true; do
+    read -r -p "$prompt [$def]: " input || return 1
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    [[ -z "$input" ]] && input="$def"
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+      printf -v "$__outvar" '%s' "$input"
+      return 0
+    fi
+    echo "Please enter an integer."
+  done
+}
+
+install_self() {
+  # install_self <src> <dst>
+  local src="$1"
+  local dst="$2"
+  local dstdir
+  dstdir="$(dirname "$dst")"
+
+  need_cmd install
+
+  if [[ "$(id -u)" -eq 0 ]]; then
+    mkdir -p "$dstdir"
+    install -m 0755 "$src" "$dst"
+    return 0
+  fi
+
+  # Non-root: use sudo only for system paths
+  if [[ "$dst" == /usr/* || "$dst" == /bin/* || "$dst" == /sbin/* || "$dst" == /usr/local/* ]]; then
+    need_cmd sudo
+    sudo mkdir -p "$dstdir"
+    sudo install -m 0755 "$src" "$dst"
+  else
+    mkdir -p "$dstdir"
+    install -m 0755 "$src" "$dst"
+  fi
+}
+
+create_systemd_timer() {
+  # create_systemd_timer mode unit exec_path cfg_path ssh_key ssh_known interval_min boot_delay_min rand_delay_sec
+  local mode="$1" unit="$2" exec_path="$3" cfg="$4" ssh_key="$5" ssh_known="$6"
+  local interval_min="$7" boot_delay_min="$8" rand_delay_sec="$9"
+
+  need_cmd systemctl
+  need_cmd install
+
+  local service_content timer_content
+  service_content=$(cat <<EOF
+[Unit]
+Description=critical-sync marker-based backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CRITICAL_SYNC_CONFIG_FILE=$cfg
+Environment=SSH_IDENTITY=$ssh_key
+Environment=SSH_KNOWN_HOSTS=$ssh_known
+ExecStart=$exec_path
+EOF
+)
+
+  timer_content=$(cat <<EOF
+[Unit]
+Description=Run critical-sync periodically
+
+[Timer]
+OnBootSec=${boot_delay_min}min
+OnUnitActiveSec=${interval_min}min
+AccuracySec=1min
+RandomizedDelaySec=${rand_delay_sec}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+)
+
+  local tmp
+  tmp="$(mktemp)"
+  # Embed the path now so the trap doesn't reference a local variable later (set -u safe)
+  local tmp_q
+  printf -v tmp_q '%q' "$tmp"
+  trap "rm -f -- $tmp_q" RETURN
+  
+
+  if [[ "$mode" == "system" ]]; then
+    local dir="/etc/systemd/system"
+    local svc="$dir/${unit}.service"
+    local tmr="$dir/${unit}.timer"
+
+    printf "%s\n" "$service_content" > "$tmp"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      install -m 0644 "$tmp" "$svc"
+    else
+      sudo install -m 0644 "$tmp" "$svc"
+    fi
+
+    printf "%s\n" "$timer_content" > "$tmp"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      install -m 0644 "$tmp" "$tmr"
+    else
+      sudo install -m 0644 "$tmp" "$tmr"
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+      systemctl daemon-reload
+      systemctl enable --now "${unit}.timer"
+    else
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now "${unit}.timer"
+    fi
+
+    echo "Created + enabled system timer: ${unit}.timer"
+    return 0
+  fi
+
+  # user mode
+  local udir="$USER_HOME/.config/systemd/user"
+  mkdir -p "$udir"
+  local usvc="$udir/${unit}.service"
+  local utmr="$udir/${unit}.timer"
+
+  printf "%s\n" "$service_content" > "$usvc"
+  printf "%s\n" "$timer_content" > "$utmr"
+
+  # Try enabling; may depend on user session
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    local uid
+    uid="$(id -u "$SUDO_USER")"
+    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user daemon-reload || true
+    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user enable --now "${unit}.timer" || true
+  else
+    systemctl --user daemon-reload || true
+    systemctl --user enable --now "${unit}.timer" || true
+  fi
+
+  echo "Created user timer files at: $udir"
+  echo "If it didn't enable (common on headless boxes), run as the user:"
+  echo "  systemctl --user enable --now ${unit}.timer"
+}
+
+
 # Init wizard
 init_wizard() {
   if ! is_tty; then
@@ -239,7 +411,6 @@ init_wizard() {
   echo
   echo "Local backup roots:"
   echo "These are the directories that will receive the mirrored '!critical' folders."
-  echo "Example: /mnt/backup2/!critical  and  /var/!critical"
   echo
 
   while true; do
@@ -258,14 +429,13 @@ init_wizard() {
   echo
   echo "Remote targets:"
   echo "Each target is an SSH host (user@host) plus a destination directory on that host."
-  echo "Example host: t@tpc"
-  echo "Example dest: ~/!critical"
   echo
 
   while true; do
     local host dest
     prompt_nonempty "Enter remote SSH target (user@host):" host
     prompt_nonempty "Enter remote destination directory on that host (e.g. ~/!critical):" dest
+
     host="${host#"${host%%[![:space:]]*}"}"; host="${host%"${host##*[![:space:]]}"}"
     dest="${dest#"${dest%%[![:space:]]*}"}"; dest="${dest%"${dest##*[![:space:]]}"}"
 
@@ -311,6 +481,77 @@ init_wizard() {
   echo
   echo "Wrote config: $CONFIG_FILE"
   echo
+
+  # optional install into PATH
+  local installed_path=""
+  if ask_yn "Install 'critical-sync' into your PATH now?" "Y"; then
+    local default_install
+    if [[ "$(id -u)" -eq 0 ]]; then
+      default_install="/usr/local/bin/critical-sync"
+    else
+      default_install="$USER_HOME/.local/bin/critical-sync"
+    fi
+
+    prompt_default "Install path" "$default_install" installed_path
+    installed_path="$(norm_path "$installed_path")"
+
+    if [[ -e "$installed_path" ]]; then
+      if ! ask_yn "File exists at $installed_path. Overwrite?" "N"; then
+        echo "Skipping install."
+        installed_path=""
+      fi
+    fi
+
+    if [[ -n "$installed_path" ]]; then
+      install_self "$SCRIPT_SELF" "$installed_path"
+      echo "Installed to: $installed_path"
+    fi
+  fi
+
+  # optional systemd timer creation
+  if ask_yn "Create a systemd timer to run critical-sync periodically?" "Y"; then
+    if ! command -v systemctl >/dev/null 2>&1; then
+      echo "WARN: systemctl not found; can't create a systemd timer on this system." >&2
+      return 0
+    fi
+
+    local unit_name="critical-sync"
+    local mode="system"
+    local interval_min="15"
+    local boot_delay_min="5"
+    local rand_delay_sec="60"
+
+    prompt_default "Timer unit name" "$unit_name" unit_name
+
+    # Default mode:
+    # - if root: system
+    # - if not root: system (via sudo) is still usually what you want on a NAS
+    if ask_yn "Create SYSTEM timer (recommended) instead of USER timer?" "Y"; then
+      mode="system"
+    else
+      mode="user"
+    fi
+
+    prompt_int_default "Run every N minutes" "15" interval_min
+    prompt_int_default "Delay after boot (minutes)" "5" boot_delay_min
+    prompt_int_default "Randomized delay (seconds)" "60" rand_delay_sec
+
+    # ExecStart: prefer installed path if we installed, else current script path
+    local exec_path
+    exec_path="${installed_path:-$SCRIPT_SELF}"
+
+    # Ensure absolute path
+    exec_path="$(readlink -f "$exec_path" 2>/dev/null || realpath "$exec_path" 2>/dev/null || echo "$exec_path")"
+
+    # IMPORTANT for timers: point explicitly at config + ssh key locations
+    local cfg_path ssh_key_path ssh_known_path
+    cfg_path="$CONFIG_FILE"
+    ssh_key_path="$SSH_IDENTITY"
+    ssh_known_path="$SSH_KNOWN_HOSTS"
+
+    create_systemd_timer "$mode" "$unit_name" "$exec_path" "$cfg_path" "$ssh_key_path" "$ssh_known_path" \
+      "$interval_min" "$boot_delay_min" "$rand_delay_sec"
+  fi
 }
 
 

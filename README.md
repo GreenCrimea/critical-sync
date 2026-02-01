@@ -53,6 +53,8 @@ Which will prompt you for:
 - all source folders
 - all local backup targets (warns if backup is on the same filesystem as source)
 - all remote backup targets (user@host, with destination directory on the target)
+- to install the script to your PATH
+- to create a systemd timer
 
 ## SSH setup for remote backups
 
