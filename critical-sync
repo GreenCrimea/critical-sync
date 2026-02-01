@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+
+# Defaults (used unless overridden by config)
+
+# Exclude patterns you never want to copy
+EXCLUDES_DEFAULT=(
+  ".Trash*"
+  "@eaDir"
+  ".DS_Store"
+)
+
+# 0 = rsync default (size+mtime), 1 = checksum (slower but thorough)
+USE_CHECKSUM_DEFAULT=1
+
+
+# Config path resolution
+# - If run via sudo from a user, prefer that users ~/.config
+resolve_config_base() {
+  local base
+  base="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+  # If running as root via sudo, prefer the invoking users config directory
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${HOME:-}" == "/root" ]]; then
+    local sudohome
+    sudohome="$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)"
+    if [[ -n "$sudohome" ]]; then
+      base="$sudohome/.config"
+    fi
+  fi
+
+  echo "$base"
+}
+
+CONFIG_BASE="$(resolve_config_base)"
+CONFIG_DIR="$CONFIG_BASE/critical-sync"
+CONFIG_FILE="$CONFIG_DIR/critical-sync.conf"
+
+# CLI flags
+DRY_RUN=0
+DO_INIT=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --init)    DO_INIT=1 ;;
+    *)
+      echo "Unknown argument: $arg" >&2
+      echo "Usage: $0 [--init] [--dry-run]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+
+# Helpers
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 2; }; }
+
+need_cmd find
+need_cmd rsync
+need_cmd flock
+need_cmd ssh
+need_cmd stat
+need_cmd mkdir
+need_cmd date
+need_cmd tee
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+
+tolower() { tr '[:upper:]' '[:lower:]'; }
+
+ask_yn() {
+  # ask_yn "Question" default(Y/N)
+  local prompt="$1"
+  local def="${2:-Y}"
+  local def_lc
+  def_lc="$(echo "$def" | tolower)"
+
+  local suffix
+  if [[ "$def_lc" == "y" ]]; then suffix=" [Y/n]"; else suffix=" [y/N]"; fi
+
+  while true; do
+    read -r -p "${prompt}${suffix} " ans || return 1
+    ans="$(echo "${ans:-}" | tolower)"
+    if [[ -z "$ans" ]]; then ans="$def_lc"; fi
+    case "$ans" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+prompt_nonempty() {
+  # prompt_nonempty "Prompt" outvar
+  local prompt="$1"
+  local __outvar="$2"
+  local input=""
+
+  while true; do
+    read -r -p "$prompt " input || return 1
+    input="${input#"${input%%[![:space:]]*}"}"   # ltrim
+    input="${input%"${input##*[![:space:]]}"}"   # rtrim
+    if [[ -n "$input" ]]; then
+      printf -v "$__outvar" '%s' "$input"
+      return 0
+    fi
+  done
+}
+
+USER_HOME="${HOME:-/root}"
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${HOME:-}" == "/root" ]]; then
+  sudohome="$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)"
+  [[ -n "$sudohome" ]] && USER_HOME="$sudohome"
+fi
+
+# SSH identity/known_hosts handling (important when running under sudo)
+SSH_USER_HOME="$USER_HOME"  # USER_HOME already resolves sudo-invoking user's home
+SSH_IDENTITY="${SSH_IDENTITY:-$SSH_USER_HOME/.ssh/id_ed25519}"
+SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS:-$SSH_USER_HOME/.ssh/known_hosts}"
+
+SSH_BASE_OPTS=(
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o IdentitiesOnly=yes
+  -i "$SSH_IDENTITY"
+  -o UserKnownHostsFile="$SSH_KNOWN_HOSTS"
+)
+RSYNC_SSH="ssh $(printf '%q ' "${SSH_BASE_OPTS[@]}")"
+
+
+norm_path() {
+  # Expand only "~" and "~/" 
+  local p="$1"
+  if [[ "$p" == "~" ]]; then
+    echo "$USER_HOME"
+  elif [[ "$p" == "~/"* ]]; then
+    echo "$USER_HOME/${p:2}"
+  else
+    echo "$p"
+  fi
+}
+
+
+fs_id() {
+  # device id for filesystem; same => same filesystem
+  stat -c %d -- "$1"
+}
+
+warn_if_same_fs_any_source() {
+  local backup_root="$1"
+  shift
+  local sources=("$@")
+
+  local b_id
+  b_id="$(fs_id "$backup_root")"
+
+  local s
+  for s in "${sources[@]}"; do
+    if [[ -d "$s" ]]; then
+      local s_id
+      s_id="$(fs_id "$s")"
+      if [[ "$s_id" == "$b_id" ]]; then
+        echo "WARNING: local backup path '$backup_root' is on the SAME filesystem as source '$s' (device id=$b_id)" >&2
+        echo "         This is not a true separate-disk backup for that source." >&2
+        return 0
+      fi
+    fi
+  done
+}
+
+write_array_block() {
+  # write_array_block NAME elements
+  local name="$1"; shift
+  echo "${name}=("
+  local x
+  for x in "$@"; do
+    # %q makes it safe to source with bash
+    printf "  %q\n" "$x"
+  done
+  echo ")"
+}
+
+
+# Notifications
+notify() {
+  local msg="$1"
+  echo "NOTIFY: $msg" >&2
+  if command -v logger >/dev/null 2>&1; then
+    logger -t critical-sync -- "$msg" || true
+  fi
+}
+
+
+# Init wizard
+init_wizard() {
+  if ! is_tty; then
+    echo "ERROR: --init requires an interactive terminal." >&2
+    exit 1
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+
+  echo
+  echo "critical-sync init"
+  echo "Config will be written to: $CONFIG_FILE"
+  echo
+
+  local -a SOURCES=()
+  local -a LOCAL_BACKUP_ROOTS=()
+  local -a REMOTE_HOSTS=()
+  local -a REMOTE_DESTS=()
+  local -a REMOTE_NOTIFY_OFFLINE=()
+
+  local v=""
+
+  # Sources
+  while true; do
+    prompt_nonempty "Enter a source root to scan (absolute path recommended):" v
+    v="$(norm_path "$v")"
+    v="${v%/}"
+    if [[ ! -d "$v" ]]; then
+      echo "WARN: '$v' does not exist as a directory right now."
+      if ! ask_yn "Add it anyway?" "N"; then
+        continue
+      fi
+    fi
+    SOURCES+=("$v")
+    if ! ask_yn "Add another source root?" "N"; then
+      break
+    fi
+  done
+
+  # Local backups
+  echo
+  echo "Local backup roots:"
+  echo "These are the directories that will receive the mirrored '!critical' folders."
+  echo "Example: /mnt/backup2/!critical  and  /var/!critical"
+  echo
+
+  while true; do
+    prompt_nonempty "Enter a local backup root directory:" v
+    v="$(norm_path "$v")"
+    v="${v%/}"
+    mkdir -p "$v"
+    warn_if_same_fs_any_source "$v" "${SOURCES[@]}"
+    LOCAL_BACKUP_ROOTS+=("$v")
+    if ! ask_yn "Add another local backup root?" "N"; then
+      break
+    fi
+  done
+
+  # Remote targets
+  echo
+  echo "Remote targets:"
+  echo "Each target is an SSH host (user@host) plus a destination directory on that host."
+  echo "Example host: t@tpc"
+  echo "Example dest: ~/!critical"
+  echo
+
+  while true; do
+    local host dest
+    prompt_nonempty "Enter remote SSH target (user@host):" host
+    prompt_nonempty "Enter remote destination directory on that host (e.g. ~/!critical):" dest
+    host="${host#"${host%%[![:space:]]*}"}"; host="${host%"${host##*[![:space:]]}"}"
+    dest="${dest#"${dest%%[![:space:]]*}"}"; dest="${dest%"${dest##*[![:space:]]}"}"
+
+    local notify_offline=0
+    if ask_yn "Notify (log) if this target is offline?" "Y"; then
+      notify_offline=1
+    fi
+
+    REMOTE_HOSTS+=("$host")
+    REMOTE_DESTS+=("$dest")
+    REMOTE_NOTIFY_OFFLINE+=("$notify_offline")
+
+    if ! ask_yn "Add another remote target?" "N"; then
+      break
+    fi
+  done
+
+  # Write config
+  {
+    echo "# critical-sync.conf"
+    echo "# Generated: $(date -Is)"
+    echo "# Edit as needed; this file is sourced by bash."
+    echo
+    echo "USE_CHECKSUM=${USE_CHECKSUM_DEFAULT}"
+    echo
+    write_array_block "EXCLUDES" "${EXCLUDES_DEFAULT[@]}"
+    echo
+    write_array_block "SOURCES" "${SOURCES[@]}"
+    echo
+    write_array_block "LOCAL_BACKUP_ROOTS" "${LOCAL_BACKUP_ROOTS[@]}"
+    echo
+    write_array_block "REMOTE_HOSTS" "${REMOTE_HOSTS[@]}"
+    echo
+    write_array_block "REMOTE_DESTS" "${REMOTE_DESTS[@]}"
+    echo
+    write_array_block "REMOTE_NOTIFY_OFFLINE" "${REMOTE_NOTIFY_OFFLINE[@]}"
+    echo
+    echo "# Optional overrides (uncomment to use):"
+    echo "# LOGFILE=\"$CONFIG_DIR/critical-sync.log\""
+    echo "# LOCKFILE=\"$CONFIG_DIR/critical-sync.lock\""
+  } > "$CONFIG_FILE"
+
+  echo
+  echo "Wrote config: $CONFIG_FILE"
+  echo
+}
+
+
+# Ensure config exists (or prompt to create)
+if (( DO_INIT == 1 )); then
+  init_wizard
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  if ! is_tty; then
+    echo "ERROR: No config found at '$CONFIG_FILE' and no TTY available to prompt." >&2
+    echo "Run interactively with: $0 --init" >&2
+    exit 1
+  fi
+
+  echo "No config found at: $CONFIG_FILE"
+  if ask_yn "Generate a config now?" "Y"; then
+    init_wizard
+  else
+    echo "Aborting (no config)." >&2
+    exit 1
+  fi
+fi
+
+source "$CONFIG_FILE"
+
+
+# Runtime defaults + validation
+
+# If user removed/forgot these in config, set safe defaults
+: "${USE_CHECKSUM:=${USE_CHECKSUM_DEFAULT}}"
+
+declare -a EXCLUDES
+if (( ${#EXCLUDES[@]} == 0 )); then
+  EXCLUDES=("${EXCLUDES_DEFAULT[@]}")
+fi
+
+declare -a SOURCES
+if (( ${#SOURCES[@]} == 0 )); then
+  echo "ERROR: SOURCES is empty in config." >&2
+  exit 2
+fi
+
+declare -a LOCAL_BACKUP_ROOTS
+if (( ${#LOCAL_BACKUP_ROOTS[@]} == 0 )); then
+  echo "ERROR: LOCAL_BACKUP_ROOTS is empty in config." >&2
+  exit 2
+fi
+
+# Optional lock/log overrides; otherwise choose writable locations
+LOCKFILE_DEFAULT="/var/lock/critical-sync.lock"
+LOGFILE_DEFAULT="/var/log/critical-sync.log"
+
+LOCKFILE="${LOCKFILE:-$LOCKFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+# If not writable, fall back into config dir
+mkdir -p "$CONFIG_DIR"
+if ! ( : >> "$LOGFILE" ) 2>/dev/null; then
+  LOGFILE="$CONFIG_DIR/critical-sync.log"
+fi
+if ! ( mkdir -p "$(dirname "$LOCKFILE")" && : >> "$LOCKFILE" ) 2>/dev/null; then
+  LOCKFILE="$CONFIG_DIR/critical-sync.lock"
+fi
+
+
+# Lock so two runs don't overlap
+mkdir -p "$(dirname "$LOCKFILE")"
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0
+
+
+# Build rsync options
+RSYNC_OPTS=(
+  -aHAX --numeric-ids
+  --delete --delete-delay
+  --partial --delay-updates
+  --mkpath
+)
+
+(( USE_CHECKSUM == 1 )) && RSYNC_OPTS+=( --checksum )
+(( DRY_RUN == 1 )) && RSYNC_OPTS+=( --dry-run )
+
+for pat in "${EXCLUDES[@]}"; do
+  RSYNC_OPTS+=( "--exclude=$pat" )
+done
+
+
+# Logging helper
+log() {
+  local msg="[$(date -Is)] $*"
+  echo "$msg" | tee -a "$LOGFILE"
+}
+
+
+# Ensure local backup roots exist
+for b in "${LOCAL_BACKUP_ROOTS[@]}"; do
+  mkdir -p "$b"
+done
+
+
+# Collect unique directories containing "!critical"
+declare -A CRIT_DIRS=()   # dir -> source_root
+
+for root in "${SOURCES[@]}"; do
+  root="${root%/}"
+  if [[ ! -d "$root" ]]; then
+    log "WARN: source root missing: $root"
+    continue
+  fi
+
+  while IFS= read -r -d '' marker; do
+    dir="$(dirname "$marker")"
+    CRIT_DIRS["$dir"]="$root"
+  done < <(find "$root" -xdev -type f -name '!critical' -print0)
+done
+
+if (( ${#CRIT_DIRS[@]} == 0 )); then
+  log "No !critical markers found. Nothing to do."
+  exit 0
+fi
+
+
+# Prepare remote availability (per target)
+declare -a REMOTE_HOSTS REMOTE_DESTS REMOTE_NOTIFY_OFFLINE
+REMOTE_COUNT=${#REMOTE_HOSTS[@]}
+
+
+remote_ok=()
+for ((i=0; i<REMOTE_COUNT; i++)); do
+  remote_ok[$i]=0
+  host="${REMOTE_HOSTS[$i]}"
+  dest="${REMOTE_DESTS[$i]}"
+
+  # Ensure base destination exists, if unreachable, mark offline
+  if ssh "${SSH_BASE_OPTS[@]}" "$host" "mkdir -p -- $dest" >/dev/null 2>&1; then
+    remote_ok[$i]=1
+  else
+    remote_ok[$i]=0
+    log "WARN: remote target offline/unreachable: $host (dest=$dest)"
+    if [[ "${REMOTE_NOTIFY_OFFLINE[$i]:-0}" -eq 1 ]]; then
+      notify "critical-sync: remote target offline: $host (dest=$dest)"
+    fi
+  fi
+done
+
+
+# Sync one critical folder
+sync_one() {
+  local src_dir="$1"
+  local src_root="$2"
+
+  local root_tag rel
+  root_tag="$(basename "$src_root")"
+
+  if [[ "$src_dir" == "$src_root" ]]; then
+    rel="__ROOT__"
+  else
+    rel="${src_dir#"$src_root"/}"
+  fi
+
+  log "SYNC: $src_dir"
+
+  # Local backups
+  for b in "${LOCAL_BACKUP_ROOTS[@]}"; do
+    local dst="${b}/${root_tag}/${rel}"
+    log "  -> local:   $dst"
+    if ! rsync "${RSYNC_OPTS[@]}" -- "$src_dir/" "$dst/"; then
+      log "ERROR: rsync to local backup failed: $dst (src=$src_dir)"
+    fi
+  done
+
+  # Remote backups
+  for ((i=0; i<REMOTE_COUNT; i++)); do
+    if [[ "${remote_ok[$i]}" -ne 1 ]]; then
+      continue
+    fi
+    local host="${REMOTE_HOSTS[$i]}"
+    local base="${REMOTE_DESTS[$i]}"
+    local dst="${base}/${root_tag}/${rel}"
+    log "  -> remote:  $host:$dst"
+    if ! rsync -e "$RSYNC_SSH" "${RSYNC_OPTS[@]}" -- "$src_dir/" "$host:$dst/"; then
+      log "ERROR: rsync to remote failed: $host:$dst (src=$src_dir)"
+    fi
+  done
+}
+
+log "Run started (dry_run=$DRY_RUN checksum=$USE_CHECKSUM). Found ${#CRIT_DIRS[@]} critical folder(s)."
+for dir in "${!CRIT_DIRS[@]}"; do
+  sync_one "$dir" "${CRIT_DIRS[$dir]}"
+done
+log "Run finished."
